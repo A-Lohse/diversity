@@ -6,71 +6,55 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-
 # --- Imports ---
-import pandas as pd
+import re
 import numpy as np
-import geopandas as gpd
+import pandas as pd
 import matplotlib.pyplot as plt
 import statsmodels.formula.api as smf
-import re
-from matplotlib import gridspec
+from tqdm import trange
 
-
+# -------------------------
+# Helpers from your project
+# -------------------------
 from src.paths import (
-    DATA_DIR, FIGURES_DIR, ensure_directories_exist
+    DATA_DIR, FIGURES_DIR, TABLES_DIR, ensure_directories_exist
 )
-from src.nationality_mappings import get_mappings
+
 from src.analysis import (
     load_core_datasets,
     create_master_dataset,
     prepare_shows_and_measurements_data,
 )
 
-# --- Ensure necessary folders exist ---
-ensure_directories_exist()
+# --------------------------------
+# Data loading / preprocessing
+# --------------------------------
 
-# --- Load country mappings ---
-
-# --- Load core data and filter for females only ---
 def load_female_model_data():
+    """Load core + profile-pic race info; keep females, drop unknown race, flag White."""
     core = load_core_datasets()
     df = create_master_dataset(core)
-    nationality2country, country_to_global, country_to_region, country_to_super_region = get_mappings()
-
-    # Map nationalities to geographic levels
-    df["country"] = df["nationality"].map(nationality2country)
-    df["region"] = df["country"].map(country_to_region)
-    df["super_region"] = df["country"].map(country_to_super_region)
-    df["global_region"] = df["country"].map(country_to_global)
 
     skincolor_data = pd.read_csv(DATA_DIR / "model_info_from_profilepic.csv")
     df["model_name"] = df["filename"].apply(lambda x: x.split(".")[0])
     skincolor_data["model_name"] = skincolor_data["image_file"].apply(lambda x: x.split(".")[0])
 
-    df = df.merge(skincolor_data, on = "model_name")
+    df = df.merge(skincolor_data, on="model_name")
     df = df.loc[df["face_detected"]]
     df = df.loc[df["predicted_race"] != "Unknown"]
-    df["is_white"] = (df["predicted_race"]=="White") * 1
+    df["is_white"] = (df["predicted_race"] == "White").astype(int)
 
     return df[df["gender_consensus"] == "female"]
 
-# --- Load geographic data (world shapefile, exclude Antarctica) ---
-def load_world_geometry():
-    shp_path = DATA_DIR / "110m_cultural/ne_110m_admin_0_countries.shp"
-    world = gpd.read_file(shp_path)
-    return world[world['NAME'] != 'Antarctica']
-
-
-
-# Define this once globally
+# EU → US dress mapping
 EU_TO_US_DRESS = {
     30: 0, 32: 2, 34: 4, 36: 6, 38: 8, 40: 10, 42: 12,
     44: 14, 46: 16, 48: 18, 50: 20, 52: 22, 54: 24
 }
 
 def parse_eu_dress_to_us(val):
-    """Convert EU dress size (or size range) to US equivalent."""
+    """Convert EU dress size (or range) to US equivalent."""
     if pd.isnull(val):
         return None
     try:
@@ -88,21 +72,20 @@ def parse_eu_dress_to_us(val):
                 return EU_TO_US_DRESS.get(avg)
         else:
             return EU_TO_US_DRESS.get(int(cleaned))
-    except:
+    except Exception:
         return None
 
 def preprocess_model_data(df):
     """
-    Clean and prepare model data by:
-    - Cleaning waist-us values (e.g., converting cm to inches)
-    - Parsing dress-eu to US sizes
-    - Dropping rows without valid sizes
-    - Creating 'plus_sized' label
+    Prepare model-level data:
+    - Parse dress-eu -> US
+    - Drop rows without valid sizes
+    - Create plus_sized label (US >= 12)
     """
     df = df.copy()
     df['dress-us_clean'] = df['dress-eu'].apply(parse_eu_dress_to_us)
     df = df.dropna(subset=['dress-us_clean'])
-    df['plus_sized'] = df['dress-us_clean'] >= 12
+    df['plus_sized'] = (df['dress-us_clean'] >= 12).astype(int)
     return df
 
 def assign_year_bin(year):
@@ -115,522 +98,431 @@ def assign_year_bin(year):
     elif 2020 <= year <= 2024:
         return "2020–2024"
     else:
-        None
+        return None
 
 def enrich_shows_with_model_data(core_data, model_data):
     """
-    Load and enrich show-level data by mapping model-level attributes.
-    Only includes years between 2011 and 2024 and models with known data.
+    Build show-level data, keep 2011–2024, map model attributes.
     """
-    shows = prepare_shows_and_measurements_data(core_data)
-
-    # Filter shows to valid years and known models
-    shows = shows[(shows["year"] >= 2011) & (shows["year"] < 2025)]
+    shows_data = prepare_shows_and_measurements_data(core_data)
+    shows_data = shows_data[(shows_data["year"] >= 2011) & (shows_data["year"] < 2025)]
     shows_data['year_bin'] = shows_data['year'].apply(assign_year_bin)
 
-    shows = shows[shows["model_id"].isin(model_data["model_id"].unique())]
+    shows_data = shows_data[shows_data["model_id"].isin(model_data["model_id"].unique())]
 
-    # Create mapping dicts from model_id to attributes
-    for col in ["plus_sized", "is_white", "predicted_race",
-                "country", "region", "super_region", "global_region"]:
-        shows[col] = shows["model_id"].map(dict(zip(model_data["model_id"], model_data[col])))
+    # map attributes from model_id
+    for col in ["plus_sized", "is_white", "predicted_race"]:
+        shows_data[col] = shows_data["model_id"].map(dict(zip(model_data["model_id"], model_data[col])))
 
-    shows = shows.dropna(subset=["global_region", "super_region"])
-    shows["plus_sized"] = shows["plus_sized"].astype(int)
+    shows_data["plus_sized"] = shows_data["plus_sized"].astype(int)
+    shows_data["is_white"] = shows_data["is_white"].astype(int)
+    return shows_data
 
-    return shows
+# --------------------------------
+# Uncertainty via counts (shares)
+# --------------------------------
 
-def compute_odds_ratio_by_year(data):
+def _wilson_ci(k, n, z=1.96):
+    """Wilson score interval for binomial proportion; returns (low, high) in [0,1]."""
+    if n is None or n == 0:
+        return (np.nan, np.nan)
+    phat = k / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = phat + z2 / (2.0 * n)
+    adj = z * np.sqrt((phat * (1.0 - phat) + z2 / (4.0 * n)) / n)
+    low = (center - adj) / denom
+    high = (center + adj) / denom
+    return (max(0.0, low), min(1.0, high))
+
+def shares_with_binomial_ci(d: pd.DataFrame, years, z=1.96) -> pd.DataFrame:
     """
-    Estimate year-varying odds ratio of being plus-sized in Global South vs Global North.
-    Returns: DataFrame with odds ratio per year.
+    Compute % plus-sized with Wilson CIs by year: overall, white, non-white.
+    Returns DF indexed by year with columns:
+      pct_overall, pct_overall_ci_low, pct_overall_ci_high,
+      pct_white,   pct_white_ci_low,   pct_white_ci_high,
+      pct_nonwhite, pct_nonwhite_ci_low, pct_nonwhite_ci_high
+    Percentages are 0–100.
     """
-    model = smf.logit(
-        formula="plus_sized ~ C(global_region, Treatment(reference='Global North')) * year",
-        data=data
-    ).fit(maxiter=100, disp=0)  # suppress fit output
+    # overall
+    g = d.groupby('year').agg(total=('model_id', 'count'),
+                              plus=('plus_sized', 'sum'))
+    g['pct_overall'] = (g['plus'] / g['total']) * 100.0
+    lows, highs = [], []
+    for k, n in zip(g['plus'].fillna(0).astype(float), g['total'].fillna(0).astype(float)):
+        lo, hi = _wilson_ci(k, n, z=z)
+        lows.append(lo * 100.0)
+        highs.append(hi * 100.0)
+    g['pct_overall_ci_low'] = lows
+    g['pct_overall_ci_high'] = highs
 
-    region_base_coef = model.params.get("C(global_region, Treatment(reference='Global North'))[T.Global South]", 0)
-    interaction_coef = model.params.get("C(global_region, Treatment(reference='Global North'))[T.Global South]:year", 0)
+    # white
+    w = d[d['is_white'] == 1].groupby('year').agg(tw=('model_id', 'count'),
+                                                  pw=('plus_sized', 'sum'))
+    w['pct_white'] = (w['pw'] / w['tw']) * 100.0
+    lows, highs = [], []
+    for k, n in zip(w['pw'].fillna(0).astype(float), w['tw'].fillna(0).astype(float)):
+        lo, hi = _wilson_ci(k, n, z=z)
+        lows.append(lo * 100.0)
+        highs.append(hi * 100.0)
+    w['pct_white_ci_low'] = lows
+    w['pct_white_ci_high'] = highs
 
-    years = np.arange(data['year'].min(), data['year'].max() + 1)
-    return pd.DataFrame({
-        "year": years,
-        "odds_ratio": [np.exp(region_base_coef + interaction_coef * y) for y in years]
+    # non-white
+    nw = d[d['is_white'] == 0].groupby('year').agg(tn=('model_id', 'count'),
+                                                   pn=('plus_sized', 'sum'))
+    nw['pct_nonwhite'] = (nw['pn'] / nw['tn']) * 100.0
+    lows, highs = [], []
+    for k, n in zip(nw['pn'].fillna(0).astype(float), nw['tn'].fillna(0).astype(float)):
+        lo, hi = _wilson_ci(k, n, z=z)
+        lows.append(lo * 100.0)
+        highs.append(hi * 100.0)
+    nw['pct_nonwhite_ci_low'] = lows
+    nw['pct_nonwhite_ci_high'] = highs
+
+    out = (g[['pct_overall', 'pct_overall_ci_low', 'pct_overall_ci_high']]
+           .join(w[['pct_white', 'pct_white_ci_low', 'pct_white_ci_high']], how='outer')
+           .join(nw[['pct_nonwhite', 'pct_nonwhite_ci_low', 'pct_nonwhite_ci_high']], how='outer'))
+    return out.reindex(years)
+
+# --------------------------------
+# Odds ratio helpers (model + OR)
+# --------------------------------
+
+def _extract_nonwhite_year_coefs(fitted_model):
+    """Return (b0, b1) for non-white main effect and its interaction with year."""
+    names = pd.Index(fitted_model.params.index)
+    base = names[names.str.contains(r"C\(is_white.*\)\[T\.0\]$", regex=True)]
+    inter = names[names.str.contains(r"C\(is_white.*\)\[T\.0\]:year$", regex=True)]
+    if len(base) != 1 or len(inter) != 1:
+        raise ValueError(f"Could not identify coefficient names. Found base={list(base)}, inter={list(inter)}")
+    return fitted_model.params[base[0]], fitted_model.params[inter[0]]
+
+def _or_by_year_from_model(model, years):
+    b0, b1 = _extract_nonwhite_year_coefs(model)
+    return pd.Series({y: np.exp(b0 + b1*y) for y in years})
+
+def _or_by_year_from_df(df, years, maxiter=100, use_regularized_fallback=True):
+    """
+    Fit the dynamic model on df and return OR(non-white vs white) by year.
+    No robust SEs needed here — we're using bootstrap percentiles for CIs.
+    """
+    try:
+        m = smf.logit(
+            formula="plus_sized ~ C(is_white, Treatment(reference=1)) * year",
+            data=df
+        ).fit(maxiter=maxiter, disp=0)
+    except Exception:
+        if not use_regularized_fallback:
+            raise
+        # mild fallback if separation/convergence issues arise
+        m = smf.logit(
+            formula="plus_sized ~ C(is_white, Treatment(reference=1)) * year",
+            data=df
+        ).fit_regularized(method='l1', maxiter=maxiter, alpha=1e-6, disp=0)
+    return _or_by_year_from_model(m, years)
+
+# --------------------------------
+# Cluster bootstrap for OR with caching
+# --------------------------------
+
+def _sample_within_year_cluster(df, years, rng):
+    """
+    Within-year cluster bootstrap on model_id; returns resampled DataFrame.
+    Resamples model_id clusters with replacement within each year and
+    re-concatenates their rows.
+    """
+    parts = []
+    for y in years:
+        block = df.loc[df['year'] == y]
+        clust = block['model_id'].dropna().unique()
+        if len(clust) == 0:
+            return None
+        sampled = rng.choice(clust, size=len(clust), replace=True)
+        parts.append(pd.concat([block.loc[block['model_id'] == cid] for cid in sampled], axis=0))
+    return pd.concat(parts, axis=0)
+
+def bootstrap_or_only_cached(
+    data: pd.DataFrame,
+    years: np.ndarray,
+    n_boot: int = 1000,
+    random_state: int = 42,
+    maxiter: int = 100,
+    cache_dir: Path | str | None = None,
+    use_cache: bool = True,
+    save_cache: bool = True,
+    save_draws: bool = True,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Cluster bootstrap (within-year over model_id) to get percentile CIs for OR(t),
+    with optional caching of results and raw draws.
+
+    Returns DataFrame with columns:
+      year, odds_ratio, ci_lower, ci_upper, n_boot_kept
+    """
+    cache_path = Path(cache_dir) if cache_dir is not None else None
+    if cache_path is not None:
+        cache_path.mkdir(parents=True, exist_ok=True)
+        or_df_path = cache_path / "or_df.csv"
+        or_draws_path = cache_path / "boot_draws_or.npz"
+
+    # Try load cache
+    if use_cache and cache_path is not None and or_df_path.exists():
+        if verbose:
+            print(f"[bootstrap_or_only_cached] Loading cached OR from {or_df_path}")
+        or_df = pd.read_csv(or_df_path)
+        cached_years = or_df['year'].to_numpy()
+        if np.array_equal(np.sort(cached_years), np.sort(years)):
+            return or_df
+        else:
+            if verbose:
+                print("[bootstrap_or_only_cached] Cached years differ from current years; recomputing.")
+
+    rng = np.random.default_rng(random_state)
+
+    # point estimate on full data
+    or_point = _or_by_year_from_df(data, years, maxiter=maxiter)
+
+    # bootstrap replicates
+    or_tables = []
+    kept = 0
+    for _ in trange(n_boot, desc="Bootstrapping OR", unit="rep", disable=not verbose):
+        sample_df = _sample_within_year_cluster(data, years, rng)
+        if sample_df is None:
+            continue
+        try:
+            or_tables.append(_or_by_year_from_df(sample_df, years, maxiter))
+            kept += 1
+        except Exception:
+            continue
+
+    if kept == 0:
+        raise RuntimeError("All bootstrap replicates failed; check data sufficiency per year.")
+
+    # stack and percentile CIs
+    or_stack = np.stack([ser.reindex(years).to_numpy(dtype=float) for ser in or_tables])  # (kept, len(years))
+    or_lo = np.nanpercentile(or_stack, 2.5, axis=0)
+    or_hi = np.nanpercentile(or_stack, 97.5, axis=0)
+
+    or_df = pd.DataFrame({
+        'year': years,
+        'odds_ratio': or_point.values,
+        'ci_lower': or_lo,
+        'ci_upper': or_hi,
+        'n_boot_kept': kept
     })
 
-
-def compute_yearly_summary(data):
-    """
-    Compute yearly summaries of total models and plus-sized shares,
-    including % of plus-sized coming from the Global South.
-    """
-    summary = data.groupby('year').agg(
-        total_models=('model_id', 'count'),
-        plus_sized=('plus_sized', 'sum'),
-        global_south_plus_sized=('plus_sized', lambda x: (
-            (data.loc[x.index, 'global_region'] == 'Global South') & (x == 1)
-        ).sum())
-    ).reset_index()
-
-    summary['pct_plus_sized'] = 100 * summary['plus_sized'] / summary['total_models']
-    summary['pct_plus_sized_from_south'] = 100 * summary['global_south_plus_sized'] / summary['plus_sized'].replace(0, pd.NA)
-    return summary
-
-
-def plot_odds_ratio_and_share(plot_df, save_path=None):
-    """
-    Dual-axis line plot:
-      - Odds ratio (Global South vs North)
-      - % of plus-sized models (overall and from Global South)
-    """
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-
-    # Primary y-axis: Odds ratio
-    ax1.plot(plot_df['year'], plot_df['odds_ratio'], color='#d62728', marker='o', label='Odds Ratio (GS vs GN)')
-    ax1.axhline(1.0, color='gray', linestyle='--')
-    ax1.set_ylabel("Odds Ratio", color='#d62728')
-    ax1.tick_params(axis='y', labelcolor='#d62728')
-
-    # Secondary y-axis: % shares
-    ax2 = ax1.twinx()
-    ax2.plot(plot_df['year'], plot_df['pct_plus_sized'], color='#1f77b4', marker='s', label='% Plus-Sized Overall')
-    ax2.plot(plot_df['year'], plot_df['pct_plus_sized_from_south'], color='#9467bd', linestyle='--', marker='x', label='% from Global South')
-    ax2.set_ylabel("Percentage (%)")
-    ax2.tick_params(axis='y', labelcolor='black')
-
-    # Combine legends
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-
-    plt.title("Odds Ratio and Plus-Sized Representation Over Time")
-    plt.xlabel("Year")
-    plt.grid(True)
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path)
-    plt.show()
-
-from matplotlib import gridspec
-
-def plot_odds_ratio_maps_by_year(world, or_by_year, save_path=None):
-    """
-    Generate maps showing odds ratio of plus-sized representation in the Global South for each selected year.
-    """
-    nationality2country, country_to_global, country_to_region, country_to_super_region = get_mappings()
-    global_north_countries = [k for k, v in country_to_global.items() if v == "Global North"]
-    global_north_countries += ["Greenland"]
-    selected_years = [2011, 2015, 2020, 2024]
-
-    cmap = plt.cm.coolwarm
-    norm = plt.Normalize(vmin=or_by_year['odds_ratio'].min(), vmax=or_by_year['odds_ratio'].max())
-
-    fig = plt.figure(figsize=(26, 6))
-    gs = gridspec.GridSpec(1, len(selected_years) + 1, width_ratios=[1]*len(selected_years) + [0.05], wspace=0)
-
-    for i, year in enumerate(selected_years):
-        ax = fig.add_subplot(gs[0, i])
-        or_value = or_by_year.loc[or_by_year['year'] == year, 'odds_ratio'].values[0]
-        or_str = f"{or_value:.2f}"
-
-        world_copy = world.copy()
-        world_copy['global_region'] = world_copy['NAME'].apply(
-            lambda x: "Global North" if x in global_north_countries else "Global South"
-        )
-        world_copy['odds_ratio'] = world_copy['global_region'].apply(
-            lambda region: or_value if region == "Global South" else np.nan
-        )
-
-        world_copy.plot(
-            column='odds_ratio',
-            cmap=cmap,
-            norm=norm,
-            linewidth=0.8,
-            edgecolor='black',
-            legend=False,
-            ax=ax,
-            missing_kwds={"color": "#1f77b4", "label": "Global North"}
-        )
-
-        ax.text(
-            -160, -55,
-            f"Year: {year}\nGlobal South OR = {or_str}",
-            fontsize=11,
-            bbox=dict(facecolor='white', edgecolor='black'),
-            verticalalignment='bottom'
-        )
-        ax.set_title(f"{year}", fontsize=14)
-        ax.set_axis_off()
-
-    # Colorbar
-    cax = fig.add_subplot(gs[0, -1])
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm._A = []
-    cbar = fig.colorbar(sm, cax=cax)
-    cbar.set_label("Odds Ratio (Global South)", fontsize=12)
-
-    fig.suptitle("Odds of Plus-Size Model Representation in the Global South (Selected Years)", fontsize=16)
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path)
-    plt.show()
-
-def compute_super_region_odds_ratios(data, ref_category="North America"):
-    """
-    Logistic regression predicting plus-sized status using super_region.
-    Returns:
-        - or_map: odds ratios by region
-        - enhanced_or_map: odds ratios + SEs + significance stars
-    """
-
-    model = smf.logit(
-        formula=f"plus_sized ~ C(super_region, Treatment(reference='{ref_category}'))",
-        data=data
-    ).fit(disp=0)
-
-    odds_ratios = np.exp(model.params)
-    conf_ints = np.exp(model.conf_int())
-    pvals = model.pvalues
-
-    or_map = {ref_category: 1.0}
-    enhanced_or_map = {
-        ref_category: {"or": 1.0, "se": 0.0, "stars": ""}
-    }
-
-    for idx in model.params.index:
-        if idx.startswith("C(super_region"):
-            region = idx.split("T.")[-1].rstrip("]")
-            or_val = odds_ratios[idx]
-            se_val = or_val * model.bse[idx]  # approximate SE of odds ratio
-
-            # Significance stars
-            pval = pvals[idx]
-            if pval < 0.001:
-                stars = "***"
-            elif pval < 0.01:
-                stars = "**"
-            elif pval < 0.05:
-                stars = "*"
-            else:
-                stars = ""
-
-            or_map[region] = or_val
-            enhanced_or_map[region] = {"or": or_val, "se": se_val, "stars": stars}
-
-    return or_map, enhanced_or_map
-
-def plot_super_region_odds_map(world, or_map, enhanced_or_map, save_path=None):
-    """
-    Plot world map colored by super_region odds ratios.
-    Annotate each region with odds ratio, SE, and significance stars.
-    """
-    nationality2country, country_to_global, country_to_region, country_to_super_region = get_mappings()
-    region_annotations = {
-        "North America": (-100, 45),
-        "South and Latin America": (-60, -15),
-        "Europe": (10, 50),
-        "Africa": (20, 0),
-        "Asia": (90, 30),
-        "Oceania": (150, -25)
-    }
-    world = world.copy()
-    world['super_region'] = world['NAME'].map(country_to_super_region)
-    world['odds_ratio'] = world['super_region'].map(or_map)
-
-    fig, ax = plt.subplots(figsize=(14, 8))
-
-    world.plot(
-        column='odds_ratio',
-        cmap='coolwarm',
-        linewidth=0.8,
-        edgecolor='black',
-        legend=True,
-        ax=ax,
-        missing_kwds={"color": "lightgrey", "label": "Missing data"}
-    )
-
-    for region, (x, y) in region_annotations.items():
-        if region in enhanced_or_map:
-            val = enhanced_or_map[region]
-            ax.text(
-                x, y,
-                f"{region}\nOR = {val['or']:.2f} (SE = {val['se']:.2f}) {val['stars']}",
-                fontsize=11,
-                ha='center',
-                bbox=dict(facecolor='white', edgecolor='black', alpha=0.7, boxstyle='round,pad=0.3')
+    # Save cache
+    if save_cache and cache_path is not None:
+        if verbose:
+            print(f"[bootstrap_or_only_cached] Saving OR results to {cache_path}")
+        or_df.to_csv(or_df_path, index=False)
+        if save_draws:
+            np.savez_compressed(
+                or_draws_path,
+                draws=or_stack,
+                years=years,
+                meta=np.array([('n_boot_requested', n_boot),
+                               ('n_boot_kept', kept),
+                               ('random_state', random_state)], dtype=object)
             )
 
-    ax.set_title("Odds Ratio of Being Plus-Sized by Super Region\n(Compared to North America)", fontsize=16)
-    ax.set_axis_off()
-    plt.tight_layout()
+    return or_df
 
+# -----------------
+# Plotting
+# -----------------
+
+def plot_race_shares_and_effect_panel(df_share, effect_df, save_path=None, scale='or'):
+    """
+    Create a 2-panel figure:
+      Left: % Plus-Sized (Overall, White, Non-White) with 95% Wilson CI bands
+      Right: Effect over time; by default, odds ratio with bootstrap percentile CI
+
+    effect_df expects:
+        - scale='or'   : ['year','odds_ratio','ci_lower','ci_upper']
+        - scale='logit': ['year','logit','ci_lower','ci_upper']  (not used here)
+    """
+
+    def _get_series(df, names):
+        for n in names:
+            if n in df.columns:
+                return df[n]
+        return None
+
+    years = df_share.index
+
+    # Resolve share columns
+    pct_overall = _get_series(df_share, ["pct_overall", "overall_pct"])
+    lo_overall  = _get_series(df_share, ["pct_overall_ci_low", "overall_ci_low"])
+    hi_overall  = _get_series(df_share, ["pct_overall_ci_high", "overall_ci_high"])
+
+    pct_white = _get_series(df_share, ["pct_white", "white_pct"])
+    lo_white  = _get_series(df_share, ["pct_white_ci_low", "white_ci_low"])
+    hi_white  = _get_series(df_share, ["pct_white_ci_high", "white_ci_high"])
+
+    pct_nonwhite = _get_series(df_share, ["pct_nonwhite", "nonwhite_pct"])
+    lo_nonwhite  = _get_series(df_share, ["pct_nonwhite_ci_low", "nonwhite_ci_low"])
+    hi_nonwhite  = _get_series(df_share, ["pct_nonwhite_ci_high", "nonwhite_ci_high"])
+
+    # --- PLOT ---
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharex=False)
+
+    # LEFT PANEL: shares
+    ax = axes[0]
+    if pct_overall is not None:
+        ax.plot(years, pct_overall, marker='o', label='% Plus-Sized (Overall)')
+        if lo_overall is not None and hi_overall is not None:
+            ax.fill_between(years, lo_overall, hi_overall, alpha=0.2)
+    if pct_white is not None:
+        ax.plot(years, pct_white, marker='s', label='% Plus-Sized (White)')
+        if lo_white is not None and hi_white is not None:
+            ax.fill_between(years, lo_white, hi_white, alpha=0.2)
+    if pct_nonwhite is not None:
+        ax.plot(years, pct_nonwhite, marker='x', linestyle='--', label='% Plus-Sized (Non-White)')
+        if lo_nonwhite is not None and hi_nonwhite is not None:
+            ax.fill_between(years, lo_nonwhite, hi_nonwhite, alpha=0.2)
+
+    ax.set_title("% Plus-Sized Models Over Time")
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Percentage (%)")
+    ax.legend()
+    ax.grid(True, axis='y', alpha=0.4)
+
+    # RIGHT PANEL: odds ratio + CI band
+    ax = axes[1]
+    ax.plot(effect_df['year'], effect_df['odds_ratio'], marker='o',
+            label='Odds Ratio (Non-white vs White)')
+    if {'ci_lower', 'ci_upper'}.issubset(effect_df.columns):
+        ax.fill_between(effect_df['year'], effect_df['ci_lower'], effect_df['ci_upper'],
+                        alpha=0.2, label='95% CI (bootstrap)')
+    ax.axhline(1.0, linestyle='--')
+    ax.set_ylabel("Odds Ratio")
+    ax.set_title("Odds Ratio Over Time")
+
+    ax.set_xlabel("Year")
+    ax.legend()
+    ax.grid(True, axis='y', alpha=0.4)
+
+    plt.tight_layout()
     if save_path:
-        plt.savefig(save_path)
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
     plt.show()
 
-def compute_odds_ratio_by_race_year(data):
+# -----------------
+# Regression tables
+# -----------------
+
+def save_logit_tables(
+    data,
+    tables_dir,
+    cluster_col="model_id",
+    maxiter=100,
+    ref_level=1,
+    static_name="logit_static.tex",
+    dynamic_name="logit_dynamic.tex",
+    verbose=True
+):
     """
-    Estimate year-varying odds ratio of being plus-sized for non-white vs white.
+    Fit two clustered logit models and save LaTeX summaries:
+      - Static:  plus_sized ~ C(is_white, Treatment(reference=ref_level))
+      - Dynamic: plus_sized ~ C(is_white, Treatment(reference=ref_level)) * year
     """
-    model = smf.logit(
-        formula="plus_sized ~ C(is_white, Treatment(reference=1)) * year",
+    tables_dir = Path(tables_dir)
+    tables_dir.mkdir(parents=True, exist_ok=True)
+
+    # Static
+    model_static = smf.logit(
+        formula=f"plus_sized ~ C(is_white, Treatment(reference={ref_level}))",
         data=data
-    ).fit(maxiter=100, disp=0)
+    ).fit(maxiter=maxiter, disp=0, cov_type='cluster',
+          cov_kwds={'groups': data[cluster_col]})
 
-    base_coef = model.params.get("C(is_white, Treatment(reference=1))[T.0]", 0)
-    interaction_coef = model.params.get("C(is_white, Treatment(reference=1))[T.0]:year", 0)
-
-    years = np.arange(data['year'].min(), data['year'].max() + 1)
-    return pd.DataFrame({
-        "year": years,
-        "odds_ratio": [np.exp(base_coef + interaction_coef * y) for y in years]
-    })
-
-
-
-def compute_yearly_race_summary(data):
-    """
-    Compute yearly summaries including:
-    - % plus-sized overall
-    - % of plus-sized who are non-white
-    - % of non-white who are not plus-sized
-    """
-    summary = data.groupby('year').agg(
-        total_models=('model_id', 'count'),
-        plus_sized=('plus_sized', 'sum'),
-        nonwhite_plus_sized=('plus_sized', lambda x: (
-            (data.loc[x.index, 'is_white'] == 0) & (x == 1)
-        ).sum()),
-        nonwhite_not_plus_sized=('plus_sized', lambda x: (
-            (data.loc[x.index, 'is_white'] == 0) & (x == 0)
-        ).sum()),
-        total_nonwhite=('is_white', lambda x: (x == 0).sum())
-    ).reset_index()
-
-    summary['pct_plus_sized'] = 100 * summary['plus_sized'] / summary['total_models']
-    summary['pct_plus_sized_nonwhite'] = 100 * summary['nonwhite_plus_sized'] / summary['plus_sized'].replace(0, pd.NA)
-    summary['pct_nonwhite_not_plus'] = 100 * summary['nonwhite_not_plus_sized'] / summary['total_nonwhite'].replace(0, pd.NA)
-
-    return summary
-
-
-def plot_odds_ratio_and_share_by_race(plot_df, save_path=None):
-    """
-    Plot odds ratio and racial shares per year.
-    """
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-
-    # OR line
-    ax1.plot(plot_df['year'], plot_df['odds_ratio'], color='#9467bd', marker='o', label='Odds Ratio (Non-white vs White)')
-    ax1.axhline(1.0, color='gray', linestyle='--')
-    ax1.set_ylabel("Odds Ratio", color='#9467bd')
-    ax1.tick_params(axis='y', labelcolor='#9467bd')
-
-    # Share lines
-    ax2 = ax1.twinx()
-    ax2.plot(plot_df['year'], plot_df['pct_plus_sized'], color='#1f77b4', marker='s', label='% Plus-Sized Overall')
-    ax2.plot(plot_df['year'], plot_df['pct_plus_sized_nonwhite'], color='#ff7f0e', linestyle='--', marker='x', label='% Plus-Sized Who Are Non-White')
-    #ax2.plot(plot_df['year'], plot_df['pct_nonwhite_not_plus'], color='#d62728', linestyle=':', marker='^', label='% Non-White Who Are Not Plus-Sized')
-
-    ax2.set_ylabel("Percentage (%)")
-    ax2.tick_params(axis='y', labelcolor='black')
-
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-
-    plt.title("Odds Ratio and Racial Representation Over Time")
-    plt.xlabel("Year")
-    plt.grid(True)
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path)
-    plt.show()
-
-
-
-
-def plot_racial_group_shares_over_time(data, save_path=None):
-    """
-    Plot % of plus-sized models by year and predicted_race.
-    """
-    yearly = data.groupby(['year', 'predicted_race']).agg(
-        total=('model_id', 'count'),
-        plus_sized=('plus_sized', 'sum')
-    ).reset_index()
-
-    yearly['pct_plus_sized'] = 100 * yearly['plus_sized'] / yearly['total']
-    pivoted = yearly.pivot(index='year', columns='predicted_race', values='pct_plus_sized').fillna(0)
-
-    plt.figure(figsize=(14, 7))
-    for col in pivoted.columns:
-        plt.plot(pivoted.index, pivoted[col], marker='o', label=col)
-
-    plt.title("% Plus-Sized Models by Predicted Race Over Time")
-    plt.xlabel("Year")
-    plt.ylabel("Percentage (%)")
-    plt.legend(title="Predicted Race")
-    plt.grid(True)
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path)
-    plt.show()
-
-
-def compute_race_odds_ratios(data, ref_category="White"):
-    """
-    Logistic regression predicting plus-sized status using predicted_race.
-    Returns:
-        - or_map: odds ratios by race
-        - enhanced_or_map: dict with ORs, SEs, and significance stars
-    """
-    model = smf.logit(
-        formula=f"plus_sized ~ C(predicted_race, Treatment(reference='{ref_category}'))",
+    # Dynamic (interaction with year)
+    model_dynamic = smf.logit(
+        formula=f"plus_sized ~ C(is_white, Treatment(reference={ref_level})) * year",
         data=data
-    ).fit(disp=0)
+    ).fit(maxiter=maxiter, disp=0, cov_type='cluster',
+          cov_kwds={'groups': data[cluster_col]})
 
-    odds_ratios = np.exp(model.params)
-    conf_ints = np.exp(model.conf_int())
-    pvals = model.pvalues
+    # Save LaTeX
+    static_path = Path(tables_dir) / static_name
+    dynamic_path = Path(tables_dir) / dynamic_name
+    with open(static_path, "w", encoding="utf-8") as f:
+        f.write(model_static.summary().as_latex())
+    with open(dynamic_path, "w", encoding="utf-8") as f:
+        f.write(model_dynamic.summary().as_latex())
 
-    or_map = {ref_category: 1.0}
-    enhanced_or_map = {
-        ref_category: {"or": 1.0, "se": 0.0, "stars": ""}
-    }
+    if verbose:
+        print(f"Saved: {static_path}")
+        print(f"Saved: {dynamic_path}")
 
-    for idx in model.params.index:
-        if idx.startswith("C(predicted_race"):
-            race = idx.split("T.")[-1].rstrip("]")
-            or_val = odds_ratios[idx]
-            se_val = or_val * model.bse[idx]  # approximate SE
+    return model_static, model_dynamic
 
-            # Significance stars
-            pval = pvals[idx]
-            if pval < 0.001:
-                stars = "***"
-            elif pval < 0.01:
-                stars = "**"
-            elif pval < 0.05:
-                stars = "*"
-            else:
-                stars = ""
-
-            or_map[race] = or_val
-            enhanced_or_map[race] = {"or": or_val, "se": se_val, "stars": stars}
-
-    return or_map, enhanced_or_map
-
-
-def plot_race_odds_barplot(enhanced_or_map, ref_category="White", save_path=None):
-    """
-    Centered bar plot of odds ratios for predicted_race (ref = White).
-    Bars grow up (OR > 1) or down (OR < 1), centered at OR = 1.
-    """
-    import matplotlib.pyplot as plt
-
-    races = list(enhanced_or_map.keys())
-    or_vals = [enhanced_or_map[r]["or"] for r in races]
-    se_vals = [enhanced_or_map[r]["se"] for r in races]
-    stars = [enhanced_or_map[r]["stars"] for r in races]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    x = range(len(races))
-    baseline = 1.0
-    bar_colors = ['#1f77b4' if r != ref_category else 'gray' for r in races]
-
-    # Plot bars centered on y=1
-    for i, (race, or_val, se, star) in enumerate(zip(races, or_vals, se_vals, stars)):
-        bar_height = or_val - baseline
-        bar_bottom = baseline if bar_height >= 0 else or_val
-        ax.bar(x[i], abs(bar_height), bottom=bar_bottom, color=bar_colors[i], alpha=0.8, capsize=4)
-
-        # Add error bar
-        ax.errorbar(x[i], or_val, yerr=se, fmt='none', ecolor='black', capsize=5)
-
-        # Add significance star
-        if star:
-            y_star = or_val + (0.05 if or_val >= baseline else -0.05)
-            va = 'bottom' if or_val >= baseline else 'top'
-            ax.text(x[i], y_star, star, ha='center', va=va, fontsize=12)
-
-    # Formatting
-    ax.axhline(baseline, color='black', linewidth=1)
-    ax.set_xticks(x)
-    ax.set_xticklabels(races, rotation=45)
-    ax.set_ylabel("Odds Ratio (ref = White)")
-    ax.set_title("Odds of Being Plus-Sized by Predicted Race")
-    ax.set_ylim(bottom=min(0.5, min(or_vals) - 0.2), top=max(1.8, max(or_vals) + 0.7))
-    ax.grid(axis='y', linestyle='--', alpha=0.6)
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path)
-    plt.show()
-
-##################main
-
+# -----------
+# MAIN
+# -----------
 
 def main():
-    # --- Setup ---
+    # Setup
     ensure_directories_exist()
-    print("Loading data...")
-    core_data = load_core_datasets()
-    nationality2country, country_to_global, country_to_region, country_to_super_region = get_mappings()
-    world = load_world_geometry()
 
-    # --- Preprocess models ---
-    print("Preprocessing model data...")
+    # Load & preprocess model-level data (female only)
+    print("Loading & preprocessing model data...")
     model_data = load_female_model_data()
     model_data = preprocess_model_data(model_data)
 
-    # --- Enrich shows with model attributes ---
+    # Build show-level dataset with mapped attributes
+    print("Preparing show-level dataset...")
+    core_data = load_core_datasets()
     shows_data = enrich_shows_with_model_data(core_data, model_data)
 
-    # --- Global North vs South Analysis ---
-    print("Running Global North vs South analysis...")
-    or_by_year = compute_odds_ratio_by_year(shows_data)
-    year_summary = compute_yearly_summary(shows_data)
-    plot_df = pd.merge(or_by_year, year_summary, on="year")
-    plot_odds_ratio_and_share(plot_df, save_path=FIGURES_DIR / "odds_ratio_over_time.png")
-
-    # --- Global Maps Over Time ---
-    plot_odds_ratio_maps_by_year(
-        world=world,
-        or_by_year=or_by_year,
-        save_path=FIGURES_DIR / "odds_ratio_maps_by_year.png"
+    # Regression tables (cluster-robust, saved to LaTeX)
+    print("Saving regression tables...")
+    _, _ = save_logit_tables(
+        data=shows_data,
+        tables_dir=TABLES_DIR,
+        cluster_col="model_id",
+        maxiter=100,
+        ref_level=1,
+        static_name="logit_static.tex",
+        dynamic_name="logit_dynamic.tex",
+        verbose=True
     )
 
-    # --- Super Region Analysis ---
-    print("Running Regional analysis...")
-    or_map, enhanced_or_map = compute_super_region_odds_ratios(shows_data)
-    plot_super_region_odds_map(
-        world=world,
-        or_map=or_map,
-        enhanced_or_map=enhanced_or_map,
-        save_path=FIGURES_DIR / "super_region_odds_map.png"
+    # Years to evaluate
+    years = np.sort(shows_data['year'].unique())
+
+    # Shares with Wilson CIs (from counts)
+    df_share = shares_with_binomial_ci(shows_data, years, z=1.96)
+
+    # Odds ratio over time with bootstrap percentile CIs + caching
+    print("Bootstrapping odds ratios (with cache)...")
+    cache_dir = DATA_DIR / "bootstrap_cache/race"
+    or_df = bootstrap_or_only_cached(
+        data=shows_data,
+        years=years,
+        n_boot=1000,
+        random_state=42,
+        maxiter=100,
+        cache_dir=cache_dir,
+        use_cache=False,      # set False to force recompute
+        save_cache=True,
+        save_draws=True,
+        verbose=True
     )
 
-    # --- Race-Based Analysis ---
-    print("Running Race-Based analysis...")
-    race_or_by_year = compute_odds_ratio_by_race_year(shows_data)
-    race_summary = compute_yearly_race_summary(shows_data)
-    race_plot_df = pd.merge(race_or_by_year, race_summary, on="year")
-    plot_odds_ratio_and_share_by_race(race_plot_df, save_path=FIGURES_DIR / "odds_ratio_race_over_time.png")
+    # Plot panel (shares + OR curve)
+    print("Saving panel plot...")
+    plot_race_shares_and_effect_panel(
+        df_share=df_share,
+        effect_df=or_df,
+        save_path=FIGURES_DIR / "race_panel_bootstrap_OR.png",
+        scale='or'
+    )
 
-    # --- Race Group Trends ---
-    print("Plotting racial group shares over time...")
-    plot_racial_group_shares_over_time(shows_data, save_path=FIGURES_DIR / "racial_group_trends.png")
-    
-    print("Running Race Odds Ratio Model (no time)...")
-    race_or_map, race_enhanced_or_map = compute_race_odds_ratios(shows_data)
-    plot_race_odds_barplot(race_enhanced_or_map, save_path=FIGURES_DIR / "race_odds_ratio.png")
+    print("Done.")
 
 if __name__ == "__main__":
     main()
-
-

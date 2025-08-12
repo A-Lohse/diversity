@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 MODELS_HTML_DIR = PROJECT_ROOT / "models_html"
 FIGURES_DIR = PROJECT_ROOT / "figures"
+TABLES_DIR = PROJECT_ROOT / "tables"
 FIGURES_ARXIV_DIR = PROJECT_ROOT / "figures_arxiv"
 
 # Core data files
