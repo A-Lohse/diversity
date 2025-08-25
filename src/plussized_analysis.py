@@ -11,7 +11,9 @@ import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import statsmodels.formula.api as smf
+from matplotlib.gridspec import GridSpec
+from scipy.optimize import curve_fit
+import statsmodels.formula.api as smf  # unused here, but kept if you need it elsewhere
 from tqdm import trange
 
 # -------------------------
@@ -118,351 +120,220 @@ def enrich_shows_with_model_data(core_data, model_data):
     shows_data["is_white"] = shows_data["is_white"].astype(int)
     return shows_data
 
-# --------------------------------
-# Uncertainty via counts (shares)
-# --------------------------------
+# ---------- Plotting helpers (integrated) ----------
 
-def _wilson_ci(k, n, z=1.96):
-    """Wilson score interval for binomial proportion; returns (low, high) in [0,1]."""
-    if n is None or n == 0:
-        return (np.nan, np.nan)
-    phat = k / n
-    z2 = z * z
-    denom = 1.0 + z2 / n
-    center = phat + z2 / (2.0 * n)
-    adj = z * np.sqrt((phat * (1.0 - phat) + z2 / (4.0 * n)) / n)
-    low = (center - adj) / denom
-    high = (center + adj) / denom
-    return (max(0.0, low), min(1.0, high))
+def _agg_share(d, col):
+    return (
+        d.groupby("year")[col]
+         .agg(["mean", "count"])
+         .rename(columns={"mean": "share", "count": "n"})
+         .reset_index()
+         .sort_values("year")
+    )
 
-def shares_with_binomial_ci(d: pd.DataFrame, years, z=1.96) -> pd.DataFrame:
+def _exp_growth(t, a, b):
+    return a * np.exp(b * t)
+
+def _fit_exp_with_stats(years, y):
+    # Fit y = a * exp(b * (year - min_year))
+    t = years - years.min()
+    y = np.clip(y, 1e-9, 1-1e-9)
+    popt, pcov = curve_fit(_exp_growth, t, y, maxfev=10000)
+    a, b = popt
+    a_se, b_se = np.sqrt(np.diag(pcov))
+    yhat = _exp_growth(t, a, b)
+    ss_res = np.sum((y - yhat)**2)
+    ss_tot = np.sum((y - np.mean(y))**2)
+    R2 = 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
+    gpy = (np.exp(b) - 1) * 100
+    dbl = np.log(2)/b if b > 0 else np.nan
+    return dict(a=a, b=b, a_se=a_se, b_se=b_se, R2=R2, gpy=gpy, dbl=dbl, pcov=pcov)
+
+def _pred_ci_band(years_fit, years_min, params):
+    # Delta-method CI for fitted mean curve
+    a, b, pcov = params["a"], params["b"], params["pcov"]
+    t = years_fit - years_min
+    yhat = _exp_growth(t, a, b)
+    eps = 1e-12
+    dy_da = yhat / max(a, eps)    # dy/da = exp(b t) = yhat/a
+    dy_db = t * yhat              # dy/db = a t exp(b t) = t*yhat
+    J = np.vstack([dy_da, dy_db]).T
+    var_pred = np.einsum("ni,ij,nj->n", J, pcov, J)
+    se = np.sqrt(np.clip(var_pred, 0, None))
+    lo = np.clip(yhat - 1.96*se, 0, 1)
+    hi = np.clip(yhat + 1.96*se, 0, 1)
+    return yhat, lo, hi
+
+def _fmt_box(name, f):
+    if np.isfinite(f["dbl"]):
+        return (
+            f"{name}:\n"
+            f"  a={f['a']:.4f}±{f['a_se']:.4f}\n"
+            f"  b={f['b']:.4f}±{f['b_se']:.4f}\n"
+            f"  R²={f['R2']:.3f}\n"
+            f"  growth≈{f['gpy']:.2f}%/yr\n"
+            f"  double≈{f['dbl']:.2f} yrs"
+        )
+    else:
+        return (
+            f"{name}:\n"
+            f"  a={f['a']:.4f}±{f['a_se']:.4f}\n"
+            f"  b={f['b']:.4f}±{f['b_se']:.4f}\n"
+            f"  R²={f['R2']:.3f}\n"
+            f"  growth≈{f['gpy']:.2f}%/yr\n"
+            f"  double=—"
+        )
+
+def _plot_exponential_grid(shows_data, savepath=None, tight_layout=True):
+    """Create the 2x2 grid:
+       - Left column (spans rows): joint Black vs White (plus_sized)
+       - Top-right: share Non-White (exp fit)
+       - Bottom-right: share Plus-Sized (exp fit)
     """
-    Compute % plus-sized with Wilson CIs by year: overall, white, non-white.
-    Returns DF indexed by year with columns:
-      pct_overall, pct_overall_ci_low, pct_overall_ci_high,
-      pct_white,   pct_white_ci_low,   pct_white_ci_high,
-      pct_nonwhite, pct_nonwhite_ci_low, pct_nonwhite_ci_high
-    Percentages are 0–100.
-    """
-    # overall
-    g = d.groupby('year').agg(total=('model_id', 'count'),
-                              plus=('plus_sized', 'sum'))
-    g['pct_overall'] = (g['plus'] / g['total']) * 100.0
-    lows, highs = [], []
-    for k, n in zip(g['plus'].fillna(0).astype(float), g['total'].fillna(0).astype(float)):
-        lo, hi = _wilson_ci(k, n, z=z)
-        lows.append(lo * 100.0)
-        highs.append(hi * 100.0)
-    g['pct_overall_ci_low'] = lows
-    g['pct_overall_ci_high'] = highs
+    # Prep
+    df = shows_data.copy()
+    df["is_white"] = df["is_white"].astype(bool)
+    df["plus_sized"] = df["plus_sized"].astype(bool)
+    df["is_nonwhite"] = ~df["is_white"]
 
-    # white
-    w = d[d['is_white'] == 1].groupby('year').agg(tw=('model_id', 'count'),
-                                                  pw=('plus_sized', 'sum'))
-    w['pct_white'] = (w['pw'] / w['tw']) * 100.0
-    lows, highs = [], []
-    for k, n in zip(w['pw'].fillna(0).astype(float), w['tw'].fillna(0).astype(float)):
-        lo, hi = _wilson_ci(k, n, z=z)
-        lows.append(lo * 100.0)
-        highs.append(hi * 100.0)
-    w['pct_white_ci_low'] = lows
-    w['pct_white_ci_high'] = highs
+    nonwhite = _agg_share(df, "is_nonwhite")
+    plus = _agg_share(df, "plus_sized")
 
-    # non-white
-    nw = d[d['is_white'] == 0].groupby('year').agg(tn=('model_id', 'count'),
-                                                   pn=('plus_sized', 'sum'))
-    nw['pct_nonwhite'] = (nw['pn'] / nw['tn']) * 100.0
-    lows, highs = [], []
-    for k, n in zip(nw['pn'].fillna(0).astype(float), nw['tn'].fillna(0).astype(float)):
-        lo, hi = _wilson_ci(k, n, z=z)
-        lows.append(lo * 100.0)
-        highs.append(hi * 100.0)
-    nw['pct_nonwhite_ci_low'] = lows
-    nw['pct_nonwhite_ci_high'] = highs
+    # Joint Black/White plus-sized
+    agg_joint = (
+        df.groupby(["year", "is_white"])["plus_sized"]
+          .agg(["mean", "count"])
+          .reset_index()
+          .rename(columns={"mean": "share", "count": "n"})
+    )
+    pivoted = agg_joint.pivot(index="year", columns="is_white", values="share").sort_index()
+    pivoted.columns = ["Black", "White"]  # False -> Black, True -> White
+    years_joint = pivoted.index.values.astype(float)
+    fits_joint = {grp: _fit_exp_with_stats(years_joint, pivoted[grp].values) for grp in ["Black", "White"]}
+    t_fit_joint = np.linspace(0, years_joint.max()-years_joint.min(), 400)
+    years_fit_joint = years_joint.min() + t_fit_joint
+    bands_joint = {lbl: _pred_ci_band(years_fit_joint, years_joint.min(), fits_joint[lbl]) for lbl in ["Black", "White"]}
 
-    out = (g[['pct_overall', 'pct_overall_ci_low', 'pct_overall_ci_high']]
-           .join(w[['pct_white', 'pct_white_ci_low', 'pct_white_ci_high']], how='outer')
-           .join(nw[['pct_nonwhite', 'pct_nonwhite_ci_low', 'pct_nonwhite_ci_high']], how='outer'))
-    return out.reindex(years)
+    # Non-White
+    yrs_nw = nonwhite["year"].to_numpy(float)
+    fit_nw = _fit_exp_with_stats(yrs_nw, nonwhite["share"].to_numpy())
+    t_fit_nw = np.linspace(0, yrs_nw.max()-yrs_nw.min(), 400)
+    years_fit_nw = yrs_nw.min() + t_fit_nw
+    yhat_nw, ylo_nw, yhi_nw = _pred_ci_band(years_fit_nw, yrs_nw.min(), fit_nw)
 
-# --------------------------------
-# Odds ratio helpers (model + OR)
-# --------------------------------
+    # Plus-Sized
+    yrs_ps = plus["year"].to_numpy(float)
+    fit_ps = _fit_exp_with_stats(yrs_ps, plus["share"].to_numpy())
+    t_fit_ps = np.linspace(0, yrs_ps.max()-yrs_ps.min(), 400)
+    years_fit_ps = yrs_ps.min() + t_fit_ps
+    yhat_ps, ylo_ps, yhi_ps = _pred_ci_band(years_fit_ps, yrs_ps.min(), fit_ps)
 
-def _extract_nonwhite_year_coefs(fitted_model):
-    """Return (b0, b1) for non-white main effect and its interaction with year."""
-    names = pd.Index(fitted_model.params.index)
-    base = names[names.str.contains(r"C\(is_white.*\)\[T\.0\]$", regex=True)]
-    inter = names[names.str.contains(r"C\(is_white.*\)\[T\.0\]:year$", regex=True)]
-    if len(base) != 1 or len(inter) != 1:
-        raise ValueError(f"Could not identify coefficient names. Found base={list(base)}, inter={list(inter)}")
-    return fitted_model.params[base[0]], fitted_model.params[inter[0]]
+    # Layout
+    fig = plt.figure(figsize=(14, 10))
+    gs = GridSpec(2, 2, figure=fig, width_ratios=[2, 1])
+    ax_joint = fig.add_subplot(gs[:, 0])
+    ax_nw = fig.add_subplot(gs[0, 1])
+    ax_ps = fig.add_subplot(gs[1, 1])
 
-def _or_by_year_from_model(model, years):
-    b0, b1 = _extract_nonwhite_year_coefs(model)
-    return pd.Series({y: np.exp(b0 + b1*y) for y in years})
+    # Consistent colors
+    color_black = "tab:blue"
+    color_white = "tab:orange"
 
-def _or_by_year_from_df(df, years, maxiter=100, use_regularized_fallback=True):
-    """
-    Fit the dynamic model on df and return OR(non-white vs white) by year.
-    No robust SEs needed here — we're using bootstrap percentiles for CIs.
-    """
-    try:
-        m = smf.logit(
-            formula="plus_sized ~ C(is_white, Treatment(reference=1)) * year",
-            data=df
-        ).fit(maxiter=maxiter, disp=0)
-    except Exception:
-        if not use_regularized_fallback:
-            raise
-        # mild fallback if separation/convergence issues arise
-        m = smf.logit(
-            formula="plus_sized ~ C(is_white, Treatment(reference=1)) * year",
-            data=df
-        ).fit_regularized(method='l1', maxiter=maxiter, alpha=1e-6, disp=0)
-    return _or_by_year_from_model(m, years)
+    # Joint plot (markers only for data; dashed fit; shaded CI)
+    for is_w, label, color in [(False, "Non-white models", color_black),
+                           (True, "White models", color_white)]:
+        sub = agg_joint[agg_joint["is_white"] == is_w].sort_values("year")
+        ax_joint.plot(sub["year"], sub["share"], "o", linestyle="None", color=color, label=f"{label} data")
 
-# --------------------------------
-# Cluster bootstrap for OR with caching
-# --------------------------------
 
-def _sample_within_year_cluster(df, years, rng):
-    """
-    Within-year cluster bootstrap on model_id; returns resampled DataFrame.
-    Resamples model_id clusters with replacement within each year and
-    re-concatenates their rows.
-    """
-    parts = []
-    for y in years:
-        block = df.loc[df['year'] == y]
-        clust = block['model_id'].dropna().unique()
-        if len(clust) == 0:
-            return None
-        sampled = rng.choice(clust, size=len(clust), replace=True)
-        parts.append(pd.concat([block.loc[block['model_id'] == cid] for cid in sampled], axis=0))
-    return pd.concat(parts, axis=0)
+    for label, color, pretty in [("Black", color_black, "Non-white Models"),
+                             ("White", color_white, "White Models")]:
+        yhat, ylo, yhi = bands_joint[label]
+        ax_joint.plot(years_fit_joint, yhat, "--", lw=2, color=color, label=f"{pretty} (Exp. fit)")
+        ax_joint.fill_between(years_fit_joint, ylo, yhi, color=color, alpha=0.15)
 
-def bootstrap_or_only_cached(
-    data: pd.DataFrame,
-    years: np.ndarray,
-    n_boot: int = 1000,
-    random_state: int = 42,
-    maxiter: int = 100,
-    cache_dir: Path | str | None = None,
-    use_cache: bool = True,
-    save_cache: bool = True,
-    save_draws: bool = True,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """
-    Cluster bootstrap (within-year over model_id) to get percentile CIs for OR(t),
-    with optional caching of results and raw draws.
+    ax_joint.set_title("Plus-Size Share by Race")
+    ax_joint.set_xlabel("Year")
+    ax_joint.set_ylabel("Share Plus-Sized")
+    ax_joint.grid(alpha=0.3)
+    ax_joint.legend(loc="upper left")
 
-    Returns DataFrame with columns:
-      year, odds_ratio, ci_lower, ci_upper, n_boot_kept
-    """
-    cache_path = Path(cache_dir) if cache_dir is not None else None
-    if cache_path is not None:
-        cache_path.mkdir(parents=True, exist_ok=True)
-        or_df_path = cache_path / "or_df.csv"
-        or_draws_path = cache_path / "boot_draws_or.npz"
+    txt_joint = _fmt_box("Non-white Models", fits_joint["Black"]) + "\n\n\n" + _fmt_box("White Models", fits_joint["White"])
+    ax_joint.text(0.02, 0.15, txt_joint,
+                  transform=ax_joint.transAxes, fontsize=9,
+                  va="bottom", ha="left", family="monospace",
+                  bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.85))
 
-    # Try load cache
-    if use_cache and cache_path is not None and or_df_path.exists():
-        if verbose:
-            print(f"[bootstrap_or_only_cached] Loading cached OR from {or_df_path}")
-        or_df = pd.read_csv(or_df_path)
-        cached_years = or_df['year'].to_numpy()
-        if np.array_equal(np.sort(cached_years), np.sort(years)):
-            return or_df
-        else:
-            if verbose:
-                print("[bootstrap_or_only_cached] Cached years differ from current years; recomputing.")
+    # Non-White subplot
+    ax_nw.plot(nonwhite["year"], nonwhite["share"], "o", linestyle="None", color=color_black, label="Non-White Models")
+    ax_nw.plot(years_fit_nw, yhat_nw, "--", lw=2, color=color_black, label="Exp. fit")
+    ax_nw.fill_between(years_fit_nw, ylo_nw, yhi_nw, color=color_black, alpha=0.15)
+    ax_nw.set_title("Non-White Models")
+    ax_nw.set_xlabel("Year"); ax_nw.set_ylabel("Share")
+    ax_nw.grid(alpha=0.3); ax_nw.legend(loc="upper left")
+    ax_nw.text(0.02, 0.15, _fmt_box("Non-White Models", fit_nw),
+               transform=ax_nw.transAxes, fontsize=9, va="bottom", ha="left", family="monospace",
+               bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.85))
 
-    rng = np.random.default_rng(random_state)
+    # Plus-Sized subplot
+    ax_ps.plot(plus["year"], plus["share"], "o", linestyle="None", color=color_white, label="Plus-sized Models")
+    ax_ps.plot(years_fit_ps, yhat_ps, "--", lw=2, color=color_white, label="Exp. Fit")
+    ax_ps.fill_between(years_fit_ps, ylo_ps, yhi_ps, color=color_white, alpha=0.15)
+    ax_ps.set_title("Share Plus-Sized Models")
+    ax_ps.set_xlabel("Year"); ax_ps.set_ylabel("Share")
+    ax_ps.grid(alpha=0.3); ax_ps.legend(loc="upper left")
+    ax_ps.text(0.02, 0.15, _fmt_box("Plus-sized Models", fit_ps),
+               transform=ax_ps.transAxes, fontsize=9, va="bottom", ha="left", family="monospace",
+               bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.85))
 
-    # point estimate on full data
-    or_point = _or_by_year_from_df(data, years, maxiter=maxiter)
+    if tight_layout:
+        plt.tight_layout()
 
-    # bootstrap replicates
-    or_tables = []
-    kept = 0
-    for _ in trange(n_boot, desc="Bootstrapping OR", unit="rep", disable=not verbose):
-        sample_df = _sample_within_year_cluster(data, years, rng)
-        if sample_df is None:
-            continue
-        try:
-            or_tables.append(_or_by_year_from_df(sample_df, years, maxiter))
-            kept += 1
-        except Exception:
-            continue
+    if savepath is not None:
+        plt.savefig(savepath, dpi=300, bbox_inches="tight")
 
-    if kept == 0:
-        raise RuntimeError("All bootstrap replicates failed; check data sufficiency per year.")
+    # Return fits for table building
+    return {
+        "Non-white models": fit_nw,
+        "White models":      fits_joint["White"],
+        "Plus-size models":  fit_ps,
+    }
 
-    # stack and percentile CIs
-    or_stack = np.stack([ser.reindex(years).to_numpy(dtype=float) for ser in or_tables])  # (kept, len(years))
-    or_lo = np.nanpercentile(or_stack, 2.5, axis=0)
-    or_hi = np.nanpercentile(or_stack, 97.5, axis=0)
 
-    or_df = pd.DataFrame({
-        'year': years,
-        'odds_ratio': or_point.values,
-        'ci_lower': or_lo,
-        'ci_upper': or_hi,
-        'n_boot_kept': kept
-    })
 
-    # Save cache
-    if save_cache and cache_path is not None:
-        if verbose:
-            print(f"[bootstrap_or_only_cached] Saving OR results to {cache_path}")
-        or_df.to_csv(or_df_path, index=False)
-        if save_draws:
-            np.savez_compressed(
-                or_draws_path,
-                draws=or_stack,
-                years=years,
-                meta=np.array([('n_boot_requested', n_boot),
-                               ('n_boot_kept', kept),
-                               ('random_state', random_state)], dtype=object)
-            )
+def make_exp_fit_table(fits: dict, outpath: Path, caption="Exponential growth model fits for model shares"):
+    rows = []
+    for label, f in fits.items():
+        def fmt_num_se(val, se):
+            return f"${val:.4f}\\ ({se:.4f})$"
+        rows.append({
+            "Group": label,
+            "$a$": fmt_num_se(f["a"], f["a_se"]),
+            "$b$": fmt_num_se(f["b"], f["b_se"]),
+            "$R^2$": f"${f['R2']:.3f}$",
+            "Growth/yr": f"${f['gpy']:.2f}\\%$",
+            "Doubling time": f"${f['dbl']:.2f}$" if np.isfinite(f["dbl"]) else "$\\text{—}$",
+        })
+    df = pd.DataFrame(rows, columns=["Group", "$a$", "$b$", "$R^2$", "Growth/yr", "Doubling time"])
 
-    return or_df
+    latex = (
+        "\\begin{table}[htbp]\n"
+        "\\centering\n"
+        f"\\caption{{{caption}}}\n"
+        "\\label{tab:expfits}\n"
+        "\\begin{tabular}{llllll}\n"
+        "\\toprule\n"
+        + " & ".join(df.columns) + " \\\\\n"
+        "\\midrule\n"
+        + "\n".join(" & ".join(map(str, row)) + " \\\\" for row in df.values)
+        + "\n\\bottomrule\n\\end{tabular}\n\\end{table}\n"
+    )
+    outpath.write_text(latex)
+    print(f"Wrote {outpath}")
+    return df
 
-# -----------------
-# Plotting
-# -----------------
 
-def plot_race_shares_and_effect_panel(df_share, effect_df, save_path=None, scale='or'):
-    """
-    Create a 2-panel figure:
-      Left: % Plus-Sized (Overall, White, Non-White) with 95% Wilson CI bands
-      Right: Effect over time; by default, odds ratio with bootstrap percentile CI
-
-    effect_df expects:
-        - scale='or'   : ['year','odds_ratio','ci_lower','ci_upper']
-        - scale='logit': ['year','logit','ci_lower','ci_upper']  (not used here)
-    """
-
-    def _get_series(df, names):
-        for n in names:
-            if n in df.columns:
-                return df[n]
-        return None
-
-    years = df_share.index
-
-    # Resolve share columns
-    pct_overall = _get_series(df_share, ["pct_overall", "overall_pct"])
-    lo_overall  = _get_series(df_share, ["pct_overall_ci_low", "overall_ci_low"])
-    hi_overall  = _get_series(df_share, ["pct_overall_ci_high", "overall_ci_high"])
-
-    pct_white = _get_series(df_share, ["pct_white", "white_pct"])
-    lo_white  = _get_series(df_share, ["pct_white_ci_low", "white_ci_low"])
-    hi_white  = _get_series(df_share, ["pct_white_ci_high", "white_ci_high"])
-
-    pct_nonwhite = _get_series(df_share, ["pct_nonwhite", "nonwhite_pct"])
-    lo_nonwhite  = _get_series(df_share, ["pct_nonwhite_ci_low", "nonwhite_ci_low"])
-    hi_nonwhite  = _get_series(df_share, ["pct_nonwhite_ci_high", "nonwhite_ci_high"])
-
-    # --- PLOT ---
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharex=False)
-
-    # LEFT PANEL: shares
-    ax = axes[0]
-    if pct_overall is not None:
-        ax.plot(years, pct_overall, marker='o', label='% Plus-Sized (Overall)')
-        if lo_overall is not None and hi_overall is not None:
-            ax.fill_between(years, lo_overall, hi_overall, alpha=0.2)
-    if pct_white is not None:
-        ax.plot(years, pct_white, marker='s', label='% Plus-Sized (White)')
-        if lo_white is not None and hi_white is not None:
-            ax.fill_between(years, lo_white, hi_white, alpha=0.2)
-    if pct_nonwhite is not None:
-        ax.plot(years, pct_nonwhite, marker='x', linestyle='--', label='% Plus-Sized (Non-White)')
-        if lo_nonwhite is not None and hi_nonwhite is not None:
-            ax.fill_between(years, lo_nonwhite, hi_nonwhite, alpha=0.2)
-
-    ax.set_title("% Plus-Sized Models Over Time")
-    ax.set_xlabel("Year")
-    ax.set_ylabel("Percentage (%)")
-    ax.legend()
-    ax.grid(True, axis='y', alpha=0.4)
-
-    # RIGHT PANEL: odds ratio + CI band
-    ax = axes[1]
-    ax.plot(effect_df['year'], effect_df['odds_ratio'], marker='o',
-            label='Odds Ratio (Non-white vs White)')
-    if {'ci_lower', 'ci_upper'}.issubset(effect_df.columns):
-        ax.fill_between(effect_df['year'], effect_df['ci_lower'], effect_df['ci_upper'],
-                        alpha=0.2, label='95% CI (bootstrap)')
-    ax.axhline(1.0, linestyle='--')
-    ax.set_ylabel("Odds Ratio")
-    ax.set_title("Odds Ratio Over Time")
-
-    ax.set_xlabel("Year")
-    ax.legend()
-    ax.grid(True, axis='y', alpha=0.4)
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=200, bbox_inches='tight')
-    plt.show()
-
-# -----------------
-# Regression tables
-# -----------------
-
-def save_logit_tables(
-    data,
-    tables_dir,
-    cluster_col="model_id",
-    maxiter=100,
-    ref_level=1,
-    static_name="logit_static.tex",
-    dynamic_name="logit_dynamic.tex",
-    verbose=True
-):
-    """
-    Fit two clustered logit models and save LaTeX summaries:
-      - Static:  plus_sized ~ C(is_white, Treatment(reference=ref_level))
-      - Dynamic: plus_sized ~ C(is_white, Treatment(reference=ref_level)) * year
-    """
-    tables_dir = Path(tables_dir)
-    tables_dir.mkdir(parents=True, exist_ok=True)
-
-    # Static
-    model_static = smf.logit(
-        formula=f"plus_sized ~ C(is_white, Treatment(reference={ref_level}))",
-        data=data
-    ).fit(maxiter=maxiter, disp=0, cov_type='cluster',
-          cov_kwds={'groups': data[cluster_col]})
-
-    # Dynamic (interaction with year)
-    model_dynamic = smf.logit(
-        formula=f"plus_sized ~ C(is_white, Treatment(reference={ref_level})) * year",
-        data=data
-    ).fit(maxiter=maxiter, disp=0, cov_type='cluster',
-          cov_kwds={'groups': data[cluster_col]})
-
-    # Save LaTeX
-    static_path = Path(tables_dir) / static_name
-    dynamic_path = Path(tables_dir) / dynamic_name
-    with open(static_path, "w", encoding="utf-8") as f:
-        f.write(model_static.summary().as_latex())
-    with open(dynamic_path, "w", encoding="utf-8") as f:
-        f.write(model_dynamic.summary().as_latex())
-
-    if verbose:
-        print(f"Saved: {static_path}")
-        print(f"Saved: {dynamic_path}")
-
-    return model_static, model_dynamic
-
-# -----------
-# MAIN
-# -----------
+# ----------- MAIN -----------
 
 def main():
     # Setup
@@ -478,51 +349,33 @@ def main():
     core_data = load_core_datasets()
     shows_data = enrich_shows_with_model_data(core_data, model_data)
 
-    # Regression tables (cluster-robust, saved to LaTeX)
-    print("Saving regression tables...")
-    _, _ = save_logit_tables(
-        data=shows_data,
-        tables_dir=TABLES_DIR,
-        cluster_col="model_id",
-        maxiter=100,
-        ref_level=1,
-        static_name="logit_static.tex",
-        dynamic_name="logit_dynamic.tex",
-        verbose=True
+    # --- Plot & save ---
+    fig_path = FIGURES_DIR / "exponential_grid_joint_nonwhite_plussized.png"
+    print(f"Creating plots → {fig_path}")
+    fits_summary = _plot_exponential_grid(shows_data, savepath=fig_path)
+
+    # (Optional) All-races plot — uncomment if you want the per-race figure & fits
+    # fig_path_allraces = FIGURES_DIR / "share_by_race_all_groups.png"
+    # print(f"Creating plots → {fig_path_allraces}")
+    # fits_all_races = _plot_all_races(shows_data, savepath=fig_path_allraces)
+    # fits_for_table = {**fits_summary, **{f"Race: {k}": v for k, v in fits_all_races.items()}}
+
+    # If you’re not plotting all races, just use fits_summary:
+    fits_for_table = fits_summary
+
+    # Save table
+    make_exp_fit_table(
+        fits_for_table,
+        TABLES_DIR / "exp_growth_models.tex",
+        caption="Exponential growth model fits for model shares"
     )
 
-    # Years to evaluate
-    years = np.sort(shows_data['year'].unique())
+    # Save table
+    make_exp_fit_table(fits_summary, TABLES_DIR / "exp_growth_models.tex",
+                    caption="Exponential growth model fits for model shares")
 
-    # Shares with Wilson CIs (from counts)
-    df_share = shares_with_binomial_ci(shows_data, years, z=1.96)
-
-    # Odds ratio over time with bootstrap percentile CIs + caching
-    print("Bootstrapping odds ratios (with cache)...")
-    cache_dir = DATA_DIR / "bootstrap_cache/race"
-    or_df = bootstrap_or_only_cached(
-        data=shows_data,
-        years=years,
-        n_boot=1000,
-        random_state=42,
-        maxiter=100,
-        cache_dir=cache_dir,
-        use_cache=False,      # set False to force recompute
-        save_cache=True,
-        save_draws=True,
-        verbose=True
-    )
-
-    # Plot panel (shares + OR curve)
-    print("Saving panel plot...")
-    plot_race_shares_and_effect_panel(
-        df_share=df_share,
-        effect_df=or_df,
-        save_path=FIGURES_DIR / "race_panel_bootstrap_OR.png",
-        scale='or'
-    )
 
     print("Done.")
 
 if __name__ == "__main__":
-    main()
+    _ = main()
