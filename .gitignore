@@ -126,6 +126,7 @@ gigi.html
 =
 a_tag[href]
 run-calculator.sh
+test_notebook.ipynb
 
 # Name/gender datasets (large external files)
 *_gender_*.csv

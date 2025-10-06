@@ -35,19 +35,15 @@ from src.analysis import (
 
 def load_female_model_data():
     """Load core + profile-pic race info; keep females, drop unknown race, flag White."""
-    core = load_core_datasets()
-    df = create_master_dataset(core)
-
+    df = pd.read_csv(DATA_DIR / "models_measure_with_gender.csv" )
     skincolor_data = pd.read_csv(DATA_DIR / "model_info_from_profilepic.csv")
-    df["model_name"] = df["filename"].apply(lambda x: x.split(".")[0])
-    skincolor_data["model_name"] = skincolor_data["image_file"].apply(lambda x: x.split(".")[0])
 
-    df = df.merge(skincolor_data, on="model_name")
+    df = df.merge(skincolor_data, left_on = "name", right_on="model_name")
     df = df.loc[df["face_detected"]]
     df = df.loc[df["predicted_race"] != "Unknown"]
     df["is_white"] = (df["predicted_race"] == "White").astype(int)
 
-    return df[df["gender_consensus"] == "female"]
+    return df[df["consensus_gender"] == "female"]
 
 # EU → US dress mapping
 EU_TO_US_DRESS = {
@@ -55,72 +51,140 @@ EU_TO_US_DRESS = {
     44: 14, 46: 16, 48: 18, 50: 20, 52: 22, 54: 24
 }
 
-def parse_eu_dress_to_us(val):
-    """Convert EU dress size (or range) to US equivalent."""
+def parse_us_dress(val):
+    """
+    Parse US dress size (or mixed EU/US range) with fallback to EU converter.
+
+    Rules:
+    - If all numbers ≤ 18 → US range → take highest, round up to even if odd.
+    - If all numbers > 18 → EU range → parse highest as EU (rounded up to even).
+    - If mixed (some ≤18, some >18) → take the lower (US) value directly.
+    - Single number → if ≤18 keep as US (rounded up to even), if >18 parse as EU (rounded up to even).
+    """
     if pd.isnull(val):
         return None
     try:
         cleaned = re.sub(r"[^\d\-]", "", str(val))
-        if '-' in cleaned:
-            parts = cleaned.split('-')
-            nums = []
-            for p in parts:
-                try:
-                    nums.append(int(p))
-                except ValueError:
-                    continue
-            if len(nums) == 2:
-                avg = round(np.mean(nums))
-                return EU_TO_US_DRESS.get(avg)
-        else:
-            return EU_TO_US_DRESS.get(int(cleaned))
+        if not cleaned:
+            return None
+
+        # Extract numeric parts
+        parts = []
+        for p in cleaned.split('-'):
+            try:
+                parts.append(int(p))
+            except ValueError:
+                continue
+
+        if not parts:
+            return None
+
+        # Case 1: mixed EU–US (some <=18, some >18)
+        if any(p > 18 for p in parts) and any(p <= 18 for p in parts):
+            lowest = min(parts)
+            # Round up to nearest even if odd
+            if lowest % 2 != 0:
+                lowest += 1
+            return lowest
+
+        # Case 2: all EU
+        if all(p > 18 for p in parts):
+            highest = max(parts)
+            if highest % 2 != 0:
+                highest += 1
+            return EU_TO_US_DRESS.get(highest, None)
+
+        # Case 3: all US
+        if all(p <= 18 for p in parts):
+            highest = max(parts)
+            if highest % 2 != 0:
+                highest += 1
+            return highest
+
     except Exception:
         return None
+
+
+def parse_eu_dress(val):
+    """
+    Parse EU dress size (or range) to US equivalent using the highest EU value.
+    - If range: take the highest EU number.
+    - If size not in mapping, round up to the nearest even number.
+    - Map using EU_TO_US_DRESS.
+    """
+    if pd.isnull(val):
+        return None
+    try:
+        cleaned = re.sub(r"[^\d\-]", "", str(val))
+        if not cleaned:
+            return None
+
+        # Extract numeric parts
+        parts = []
+        for p in cleaned.split('-'):
+            try:
+                parts.append(int(p))
+            except ValueError:
+                continue
+
+        if not parts:
+            return None
+
+        # Take the highest EU size
+        highest = max(parts)
+
+        # Round up to nearest even if not even
+        if highest % 2 != 0:
+            highest += 1
+
+        # Map to US size
+        return EU_TO_US_DRESS.get(highest, None)
+
+    except Exception:
+        return None
+
 
 def preprocess_model_data(df):
     """
     Prepare model-level data:
-    - Parse dress-eu -> US
-    - Drop rows without valid sizes
+    - Parse dress-eu and dress-us -> US
+    - Drop rows that dont agree
     - Create plus_sized label (US >= 12)
     """
     df = df.copy()
-    df['dress-us_clean'] = df['dress-eu'].apply(parse_eu_dress_to_us)
-    df = df.dropna(subset=['dress-us_clean'])
-    df['plus_sized'] = (df['dress-us_clean'] >= 12).astype(int)
+    df["dress_size_us_parsed"] = df['dress-us'].apply(parse_us_dress)
+    df["dress_size_eu_parsed"] = df['dress-eu'].apply(parse_eu_dress)
+    
+    #keep the ones where they agree
+    overlap_mask = df["dress_size_us_parsed"] == df["dress_size_eu_parsed"]
+    df = df[overlap_mask]
+
+    #assign a cress size and plusized var: 
+    df["dress_size"]  =df["dress_size_us_parsed"] #could be either they are the same now
+    df['plus_sized'] = (df['dress_size'] >= 12).astype(int)
     return df
 
-def assign_year_bin(year):
-    if 2011 <= year <= 2013:
-        return "2011–2013"
-    elif 2014 <= year <= 2016:
-        return "2014–2016"
-    elif 2017 <= year <= 2019:
-        return "2017–2019"
-    elif 2020 <= year <= 2024:
-        return "2020–2024"
-    else:
-        return None
-
-def enrich_shows_with_model_data(core_data, model_data):
+def load_and_enrich_shows_data(model_data):
     """
-    Build show-level data, keep 2011–2024, map model attributes.
+    Build show-level data, keep 2006–2024, map model attributes.
     """
-    shows_data = prepare_shows_and_measurements_data(core_data)
-    shows_data = shows_data[(shows_data["year"] >= 2011) & (shows_data["year"] < 2025)]
-    shows_data['year_bin'] = shows_data['year'].apply(assign_year_bin)
-
-    shows_data = shows_data[shows_data["model_id"].isin(model_data["model_id"].unique())]
+    shows_data =  pd.read_csv(DATA_DIR / "career_shows_merged.csv")    
+    shows_data = shows_data[(shows_data["year"] >= 2006) & (shows_data["year"] < 2025)]
+    shows_data["year"] = shows_data["year"].astype(int)
+    #keep only show apperances we have data on
+    model_names = model_data["name"].unique()
+    shows_data = shows_data[shows_data["model_name"].isin(model_names)]
 
     # map attributes from model_id
     for col in ["plus_sized", "is_white", "predicted_race"]:
-        shows_data[col] = shows_data["model_id"].map(dict(zip(model_data["model_id"], model_data[col])))
+        shows_data[col] = shows_data["model_name"].map(dict(zip(model_data["name"], model_data[col])))
 
     shows_data["plus_sized"] = shows_data["plus_sized"].astype(int)
     shows_data["is_white"] = shows_data["is_white"].astype(int)
     return shows_data
 
-# ---------- Plotting helpers (integrated) ----------
+
+
 
 def _agg_share(d, col):
     return (
@@ -160,9 +224,10 @@ def _pred_ci_band(years_fit, years_min, params):
     J = np.vstack([dy_da, dy_db]).T
     var_pred = np.einsum("ni,ij,nj->n", J, pcov, J)
     se = np.sqrt(np.clip(var_pred, 0, None))
-    lo = np.clip(yhat - 1.96*se, 0, 1)
-    hi = np.clip(yhat + 1.96*se, 0, 1)
+    lo = np.clip(yhat - 1.96*se, 0, 1) #clipped because we are modelling shares 
+    hi = np.clip(yhat + 1.96*se, 0, 1) #clipped because we are modelling shares 
     return yhat, lo, hi
+
 
 def _fmt_box(name, f):
     if np.isfinite(f["dbl"]):
@@ -207,12 +272,13 @@ def _plot_exponential_grid(shows_data, savepath=None, tight_layout=True):
           .rename(columns={"mean": "share", "count": "n"})
     )
     pivoted = agg_joint.pivot(index="year", columns="is_white", values="share").sort_index()
-    pivoted.columns = ["Black", "White"]  # False -> Black, True -> White
+    pivoted.columns = ["Non-White", "White"]  # False -> Black, True -> White
     years_joint = pivoted.index.values.astype(float)
-    fits_joint = {grp: _fit_exp_with_stats(years_joint, pivoted[grp].values) for grp in ["Black", "White"]}
+    
+    fits_joint = {grp: _fit_exp_with_stats(years_joint, pivoted[grp].values) for grp in ["Non-White", "White"]}
     t_fit_joint = np.linspace(0, years_joint.max()-years_joint.min(), 400)
     years_fit_joint = years_joint.min() + t_fit_joint
-    bands_joint = {lbl: _pred_ci_band(years_fit_joint, years_joint.min(), fits_joint[lbl]) for lbl in ["Black", "White"]}
+    bands_joint = {lbl: _pred_ci_band(years_fit_joint, years_joint.min(), fits_joint[lbl]) for lbl in ["Non-White", "White"]}
 
     # Non-White
     yrs_nw = nonwhite["year"].to_numpy(float)
@@ -246,7 +312,7 @@ def _plot_exponential_grid(shows_data, savepath=None, tight_layout=True):
         ax_joint.plot(sub["year"], sub["share"], "o", linestyle="None", color=color, label=f"{label} data")
 
 
-    for label, color, pretty in [("Black", color_black, "Non-white Models"),
+    for label, color, pretty in [("Non-White", color_black, "Non-white Models"),
                              ("White", color_white, "White Models")]:
         yhat, ylo, yhi = bands_joint[label]
         ax_joint.plot(years_fit_joint, yhat, "--", lw=2, color=color, label=f"{pretty} (Exp. fit)")
@@ -258,7 +324,7 @@ def _plot_exponential_grid(shows_data, savepath=None, tight_layout=True):
     ax_joint.grid(alpha=0.3)
     ax_joint.legend(loc="upper left")
 
-    txt_joint = _fmt_box("Non-white Models", fits_joint["Black"]) + "\n\n\n" + _fmt_box("White Models", fits_joint["White"])
+    txt_joint = _fmt_box("Non-white Models", fits_joint["Non-White"]) + "\n\n\n" + _fmt_box("White Models", fits_joint["White"])
     ax_joint.text(0.02, 0.15, txt_joint,
                   transform=ax_joint.transAxes, fontsize=9,
                   va="bottom", ha="left", family="monospace",
@@ -286,6 +352,14 @@ def _plot_exponential_grid(shows_data, savepath=None, tight_layout=True):
                transform=ax_ps.transAxes, fontsize=9, va="bottom", ha="left", family="monospace",
                bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.85))
 
+    # Force integer year ticks for all subplots
+    for ax in [ax_joint, ax_nw, ax_ps]:
+        years_min = int(min(df["year"]))
+        years_max = int(max(df["year"]))
+        ax.set_xticks(np.arange(years_min, years_max + 1, 2))  # every 2 years
+        ax.set_xticklabels(np.arange(years_min, years_max + 1, 2))
+        ax.tick_params(axis='x', rotation=45)
+
     if tight_layout:
         plt.tight_layout()
 
@@ -295,8 +369,9 @@ def _plot_exponential_grid(shows_data, savepath=None, tight_layout=True):
     # Return fits for table building
     return {
         "Non-white models": fit_nw,
-        "White models":      fits_joint["White"],
-        "Plus-size models":  fit_ps,
+         "Plus-size models":  fit_ps,
+        "White plus-size models": fits_joint["White"],
+        "Non-white plus-size models":  fits_joint["Non-White"],
     }
 
 
@@ -333,6 +408,7 @@ def make_exp_fit_table(fits: dict, outpath: Path, caption="Exponential growth mo
     return df
 
 
+
 # ----------- MAIN -----------
 
 def main():
@@ -346,26 +422,16 @@ def main():
 
     # Build show-level dataset with mapped attributes
     print("Preparing show-level dataset...")
-    core_data = load_core_datasets()
-    shows_data = enrich_shows_with_model_data(core_data, model_data)
+    shows_data = load_and_enrich_shows_data(model_data)
 
     # --- Plot & save ---
     fig_path = FIGURES_DIR / "exponential_grid_joint_nonwhite_plussized.png"
     print(f"Creating plots → {fig_path}")
     fits_summary = _plot_exponential_grid(shows_data, savepath=fig_path)
 
-    # (Optional) All-races plot — uncomment if you want the per-race figure & fits
-    # fig_path_allraces = FIGURES_DIR / "share_by_race_all_groups.png"
-    # print(f"Creating plots → {fig_path_allraces}")
-    # fits_all_races = _plot_all_races(shows_data, savepath=fig_path_allraces)
-    # fits_for_table = {**fits_summary, **{f"Race: {k}": v for k, v in fits_all_races.items()}}
-
-    # If you’re not plotting all races, just use fits_summary:
-    fits_for_table = fits_summary
-
     # Save table
     make_exp_fit_table(
-        fits_for_table,
+        fits_summary,
         TABLES_DIR / "exp_growth_models.tex",
         caption="Exponential growth model fits for model shares"
     )
