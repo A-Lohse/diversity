@@ -423,7 +423,7 @@ def main():
     # Build show-level dataset with mapped attributes
     print("Preparing show-level dataset...")
     shows_data = load_and_enrich_shows_data(model_data)
-
+    print(shows_data.shape)
     # --- Plot & save ---
     fig_path = FIGURES_DIR / "exponential_grid_joint_nonwhite_plussized.png"
     print(f"Creating plots → {fig_path}")
